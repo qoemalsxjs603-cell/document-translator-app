@@ -3,7 +3,6 @@ import io
 import os
 import re
 import json
-import time
 import hashlib
 import tempfile
 from pathlib import Path
@@ -11,13 +10,12 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
-from openai import OpenAI
+from google import genai
 
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from docx import Document
 from openpyxl import load_workbook
-from openpyxl.styles import Font
 
 load_dotenv()
 
@@ -28,10 +26,17 @@ LANGUAGE_OPTIONS = {
     "영어": "English",
 }
 
-DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 
-# ---------------- 공통 유틸 ----------------
+def get_secret_or_env(key, default=None):
+    try:
+        if key in st.secrets:
+            return st.secrets[key]
+    except Exception:
+        pass
+    return os.getenv(key, default)
+
 
 def has_translatable_text(text: str) -> bool:
     if text is None:
@@ -41,7 +46,6 @@ def has_translatable_text(text: str) -> bool:
         return False
     if s.startswith("="):
         return False
-    # 숫자/기호만 있는 내용은 제외
     return bool(re.search(r"[A-Za-z가-힣一-龥ぁ-ゔァ-ヴー]", s))
 
 
@@ -81,7 +85,10 @@ def extract_json_array(text: str):
 
 @st.cache_resource
 def get_client():
-    return OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    api_key = get_secret_or_env("GEMINI_API_KEY")
+    if not api_key:
+        raise ValueError("GEMINI_API_KEY가 설정되어 있지 않습니다. Streamlit Secrets에 API 키를 입력하세요.")
+    return genai.Client(api_key=api_key)
 
 
 def build_glossary_text(glossary_file):
@@ -89,7 +96,6 @@ def build_glossary_text(glossary_file):
         return ""
 
     name = glossary_file.name.lower()
-
     try:
         if name.endswith(".xlsx"):
             df = pd.read_excel(glossary_file)
@@ -103,7 +109,6 @@ def build_glossary_text(glossary_file):
     if df.empty:
         return ""
 
-    # 첫 2개 컬럼을 원문/번역어로 간주
     cols = list(df.columns)
     if len(cols) < 2:
         return ""
@@ -142,7 +147,7 @@ Rules:
 - Output array length must equal input array length.
 - Do not add explanations.
 - Preserve line breaks as much as possible.
-- Preserve numbers, dates, names, URLs, email addresses, and placeholders.
+- Preserve numbers, dates, names, brand names, URLs, email addresses, and placeholders.
 - Preserve bullet symbols when possible.
 - Keep titles concise.
 - If a phrase is already in the target language, keep it natural.
@@ -154,16 +159,20 @@ Style:
 {glossary_rule}
 """.strip()
 
-    response = client.responses.create(
+    prompt = f"""
+{system_prompt}
+
+Input JSON array:
+{json.dumps(texts, ensure_ascii=False)}
+""".strip()
+
+    response = client.models.generate_content(
         model=model,
-        input=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": json.dumps(texts, ensure_ascii=False)},
-        ],
-        temperature=0.2,
+        contents=prompt,
     )
 
-    arr = extract_json_array(response.output_text)
+    arr = extract_json_array(response.text)
+
     if len(arr) != len(texts):
         raise ValueError(f"번역 결과 개수 불일치: 원문 {len(texts)}개 / 번역 {len(arr)}개")
 
@@ -171,9 +180,6 @@ Style:
 
 
 def translate_texts_with_cache(texts, target_language, model, style, glossary_text, batch_size, progress=None):
-    """
-    중복 텍스트 제거 + 세션 캐시 사용.
-    """
     if "translation_cache" not in st.session_state:
         st.session_state["translation_cache"] = {}
 
@@ -223,8 +229,6 @@ def make_log_excel(rows, output_path):
     df.to_excel(output_path, index=False)
 
 
-# ---------------- PPTX 처리 ----------------
-
 def iter_ppt_shapes(shapes):
     for shape in shapes:
         yield shape
@@ -260,7 +264,6 @@ def collect_pptx_texts(path):
 
 
 def apply_to_text_frame(text_frame, translated):
-    # 최대한 첫 run 스타일 유지
     if text_frame.paragraphs and text_frame.paragraphs[0].runs:
         text_frame.paragraphs[0].runs[0].text = translated
         for p in text_frame.paragraphs:
@@ -271,9 +274,6 @@ def apply_to_text_frame(text_frame, translated):
                 r.text = ""
     else:
         text_frame.text = translated
-
-    # PPT 텍스트 박스 넘침 완화를 위한 자동 크기 축소는 python-pptx 한계가 있어
-    # 폰트 크기 지정은 하지 않고 원본 스타일을 최대 보존한다.
 
 
 def translate_pptx(input_path, translation_map, output_path):
@@ -297,8 +297,6 @@ def translate_pptx(input_path, translation_map, output_path):
 
     prs.save(output_path)
 
-
-# ---------------- DOCX 처리 ----------------
 
 def collect_docx_texts(path):
     doc = Document(path)
@@ -368,8 +366,6 @@ def translate_docx(input_path, translation_map, output_path):
     doc.save(output_path)
 
 
-# ---------------- XLSX 처리 ----------------
-
 def collect_xlsx_texts(path):
     wb = load_workbook(path)
     texts = []
@@ -403,18 +399,16 @@ def translate_xlsx(input_path, translation_map, output_path):
     wb.save(output_path)
 
 
-# ---------------- Streamlit UI ----------------
-
 def main():
-    st.set_page_config(page_title="문서 번역기 Pro", page_icon="🌐", layout="wide")
+    st.set_page_config(page_title="문서 번역기 Gemini", page_icon="🌐", layout="wide")
 
-    st.title("문서 번역기 Pro")
+    st.title("문서 번역기 Gemini")
     st.caption("PPTX / DOCX / XLSX 파일을 업로드하면 중국어 또는 영어로 번역한 파일을 생성합니다.")
 
     with st.sidebar:
         st.header("번역 설정")
         target_label = st.selectbox("번역 언어", ["중국어", "영어"])
-        model = st.text_input("모델", value=DEFAULT_MODEL)
+        model = st.text_input("Gemini 모델", value=get_secret_or_env("GEMINI_MODEL", DEFAULT_MODEL))
 
         style_label = st.selectbox(
             "번역 스타일",
@@ -431,7 +425,7 @@ def main():
             "외부 발표용 마케팅 문체": "Polished marketing style. Natural and suitable for external presentations.",
         }
 
-        batch_size = st.slider("번역 배치 크기", 5, 60, 25, 5)
+        batch_size = st.slider("번역 배치 크기", 5, 60, 20, 5)
 
         st.divider()
         st.subheader("선택 기능")
@@ -453,8 +447,8 @@ def main():
         help="여러 파일을 한 번에 업로드할 수 있습니다.",
     )
 
-    if not os.getenv("OPENAI_API_KEY"):
-        st.warning("OPENAI_API_KEY가 설정되어 있지 않습니다. .env 파일에 API 키를 입력하세요.")
+    if not get_secret_or_env("GEMINI_API_KEY"):
+        st.warning("GEMINI_API_KEY가 설정되어 있지 않습니다. Streamlit Secrets에 API 키를 입력하세요.")
 
     if uploaded_files:
         st.write("업로드된 파일")
